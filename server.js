@@ -1632,6 +1632,363 @@ app.delete('/api/whatsapp/keywords/:keyword', (req, res) => {
   res.json({ ok: true, deleted: keyword });
 });
 
+// ─── CRM Scrape Endpoints ───────────────────────────────────────────────
+
+app.post('/api/whatsapp/scrape', async (req, res) => {
+  try {
+    const result = await scrapeAllGroups();
+    res.json(result);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/whatsapp/scrape/:groupId', async (req, res) => {
+  const { groupId } = req.params;
+  const accountId = req.body.account || 'default';
+  const acc = accounts.get(accountId);
+  if (!acc || !acc.ready) return res.status(503).json({ error: 'Account not ready' });
+
+  try {
+    const chats = await acc.client.getChats();
+    const group = chats.find(c => c.isGroup && c.id._serialized === groupId);
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    const result = await scrapeGroupParticipants(acc.client, group);
+    saveCRM();
+    res.json(result);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── CRM Contact Endpoints ─────────────────────────────────────────────
+
+app.get('/api/whatsapp/crm/contacts', (req, res) => {
+  let contactList = Array.from(crmContacts.values()).map(c => {
+    c.score = calculateScore(c);
+    c.status = c.blocked ? 'blocked' : statusFromScore(c.score);
+    return c;
+  });
+
+  // Filter by status
+  if (req.query.status) {
+    const statuses = req.query.status.split(',').map(s => s.trim());
+    contactList = contactList.filter(c => statuses.includes(c.status));
+  }
+
+  // Filter by tags
+  if (req.query.tags) {
+    const tags = req.query.tags.split(',').map(t => t.trim().toLowerCase());
+    contactList = contactList.filter(c => c.tags.some(t => tags.includes(t.toLowerCase())));
+  }
+
+  // Filter by list
+  if (req.query.list) {
+    contactList = contactList.filter(c => c.lists.includes(req.query.list));
+  }
+
+  // Search by name/phone
+  if (req.query.q) {
+    const q = req.query.q.toLowerCase();
+    contactList = contactList.filter(c =>
+      (c.name && c.name.toLowerCase().includes(q)) ||
+      (c.pushName && c.pushName.toLowerCase().includes(q)) ||
+      (c.phone && c.phone.includes(q)) ||
+      (c.id && c.id.includes(q))
+    );
+  }
+
+  // Sort
+  const sort = req.query.sort || 'updatedAt';
+  if (sort === 'score') {
+    contactList.sort((a, b) => (b.score || 0) - (a.score || 0));
+  } else if (sort === 'lastActive') {
+    contactList.sort((a, b) => {
+      const aTime = a.profile?.lastActive || a.updatedAt || '';
+      const bTime = b.profile?.lastActive || b.updatedAt || '';
+      return bTime.localeCompare(aTime);
+    });
+  } else {
+    contactList.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }
+
+  // Pagination
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const total = contactList.length;
+  contactList = contactList.slice(offset, offset + limit);
+
+  res.json({ contacts: contactList, total, limit, offset });
+});
+
+app.get('/api/whatsapp/crm/contacts/stats', (req, res) => {
+  const all = Array.from(crmContacts.values());
+  const byStatus = {};
+  const bySource = {};
+  for (const c of all) {
+    const score = calculateScore(c);
+    const status = c.blocked ? 'blocked' : statusFromScore(score);
+    byStatus[status] = (byStatus[status] || 0) + 1;
+    const groupName = c.source?.groupName || 'unknown';
+    bySource[groupName] = (bySource[groupName] || 0) + 1;
+  }
+  res.json({ total: all.length, byStatus, bySource });
+});
+
+app.get('/api/whatsapp/crm/contacts/export', (req, res) => {
+  const all = Array.from(crmContacts.values());
+  const escape = (s) => `"${(s || '').toString().replace(/"/g, '""')}"`;
+  const header = 'id,phone,name,pushName,status,score,tags,lists,language,messageCount,firstMessage,lastMessage,dmSent,responded,createdAt,updatedAt';
+  const rows = all.map(c => [
+    escape(c.id), escape(c.phone), escape(c.name), escape(c.pushName),
+    escape(c.blocked ? 'blocked' : statusFromScore(calculateScore(c))),
+    calculateScore(c),
+    escape((c.tags || []).join(';')), escape((c.lists || []).join(';')),
+    escape(c.profile?.language), c.profile?.messageCount || 0,
+    escape(c.profile?.firstMessage), escape(c.profile?.lastMessage),
+    c.profile?.dmSent || false, c.profile?.responded || false,
+    escape(c.createdAt), escape(c.updatedAt),
+  ].join(','));
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename=crm-contacts.csv');
+  res.send([header, ...rows].join('\n'));
+});
+
+app.get('/api/whatsapp/crm/contacts/:id', (req, res) => {
+  const contact = getCrmContact(req.params.id);
+  if (!contact) return res.status(404).json({ error: 'Contact not found' });
+  res.json({ contact });
+});
+
+app.put('/api/whatsapp/crm/contacts/:id', (req, res) => {
+  const contact = getCrmContact(req.params.id);
+  if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+  const { tags, status, name, notes, score } = req.body;
+  const updates = {};
+  if (tags) updates.tags = tags;
+  if (name) updates.name = name;
+  if (score !== undefined) updates.score = Number(score);
+  if (status === 'customer' || status === 'vip') {
+    if (status === 'customer') updates.score = 75;
+    if (status === 'vip') updates.score = 90;
+  }
+  if (notes !== undefined) updates.profile = { ...updates.profile, notes };
+
+  const updated = upsertCrmContact(req.params.id, updates);
+  saveCRM();
+  res.json({ ok: true, contact: updated });
+});
+
+app.delete('/api/whatsapp/crm/contacts/:id', (req, res) => {
+  if (!crmContacts.has(req.params.id)) return res.status(404).json({ error: 'Contact not found' });
+  crmContacts.delete(req.params.id);
+  crmDirty = true;
+  saveCRM();
+  res.json({ ok: true, deleted: req.params.id });
+});
+
+app.post('/api/whatsapp/crm/contacts/:id/dm', async (req, res) => {
+  const contact = getCrmContact(req.params.id);
+  if (!contact) return res.status(404).json({ error: 'Contact not found' });
+  if (contact.blocked) return res.status(400).json({ error: 'Contact is blocked' });
+
+  const { message, account } = req.body;
+  if (!message) return res.status(400).json({ error: 'message required' });
+
+  const accountId = account || 'default';
+  const acc = accounts.get(accountId);
+  if (!acc || !acc.ready) return res.status(503).json({ error: 'Account not ready' });
+
+  try {
+    const jid = contact.id + '@c.us';
+    await acc.client.sendMessage(jid, message);
+    upsertCrmContact(contact.id, {
+      profile: { dmSent: true, dmSentAt: new Date().toISOString() },
+    });
+    saveCRM();
+    res.json({ ok: true, sent: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Contact Lists ──────────────────────────────────────────────────────
+
+app.post('/api/whatsapp/lists', (req, res) => {
+  const { name, description } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+  const lists = loadJSON(LISTS_FILE, []);
+  if (lists.find(l => l.id === id)) return res.status(409).json({ error: 'List already exists' });
+
+  const list = { id, name, description: description || '', createdAt: new Date().toISOString() };
+  lists.push(list);
+  saveJSON(LISTS_FILE, lists);
+  res.json({ ok: true, list });
+});
+
+app.get('/api/whatsapp/lists', (req, res) => {
+  const lists = loadJSON(LISTS_FILE, []);
+  const all = Array.from(crmContacts.values());
+  const result = lists.map(l => ({
+    ...l,
+    contactCount: all.filter(c => c.lists.includes(l.id)).length,
+  }));
+  res.json({ lists: result });
+});
+
+app.get('/api/whatsapp/lists/:id', (req, res) => {
+  const lists = loadJSON(LISTS_FILE, []);
+  const list = lists.find(l => l.id === req.params.id);
+  if (!list) return res.status(404).json({ error: 'List not found' });
+
+  const contacts = Array.from(crmContacts.values())
+    .filter(c => c.lists.includes(req.params.id))
+    .map(c => { c.score = calculateScore(c); c.status = c.blocked ? 'blocked' : statusFromScore(c.score); return c; });
+
+  res.json({ list, contacts });
+});
+
+app.post('/api/whatsapp/lists/:id/contacts', (req, res) => {
+  const { contactIds } = req.body;
+  if (!contactIds || !Array.isArray(contactIds)) return res.status(400).json({ error: 'contactIds array required' });
+
+  const lists = loadJSON(LISTS_FILE, []);
+  if (!lists.find(l => l.id === req.params.id)) return res.status(404).json({ error: 'List not found' });
+
+  let added = 0;
+  for (const cid of contactIds) {
+    const contact = crmContacts.get(cid);
+    if (contact && !contact.lists.includes(req.params.id)) {
+      contact.lists.push(req.params.id);
+      added++;
+      crmDirty = true;
+    }
+  }
+  saveCRM();
+  res.json({ ok: true, added });
+});
+
+app.delete('/api/whatsapp/lists/:id/contacts', (req, res) => {
+  const { contactIds } = req.body;
+  if (!contactIds || !Array.isArray(contactIds)) return res.status(400).json({ error: 'contactIds array required' });
+
+  let removed = 0;
+  for (const cid of contactIds) {
+    const contact = crmContacts.get(cid);
+    if (contact) {
+      const idx = contact.lists.indexOf(req.params.id);
+      if (idx >= 0) {
+        contact.lists.splice(idx, 1);
+        removed++;
+        crmDirty = true;
+      }
+    }
+  }
+  saveCRM();
+  res.json({ ok: true, removed });
+});
+
+// ─── Bulk DM from List ──────────────────────────────────────────────────
+
+app.post('/api/whatsapp/lists/:id/broadcast', async (req, res) => {
+  const lists = loadJSON(LISTS_FILE, []);
+  if (!lists.find(l => l.id === req.params.id)) return res.status(404).json({ error: 'List not found' });
+
+  const { message, account } = req.body;
+  if (!message) return res.status(400).json({ error: 'message required' });
+
+  const accountId = account || 'default';
+  const acc = accounts.get(accountId);
+  if (!acc || !acc.ready) return res.status(503).json({ error: 'Account not ready' });
+
+  const contacts = Array.from(crmContacts.values()).filter(c => c.lists.includes(req.params.id));
+  const settings = getCrmSettings();
+  const cooldownMs = settings.autoDmCooldownHours * 60 * 60 * 1000;
+
+  let sent = 0, skipped = 0, failed = 0;
+
+  for (const contact of contacts) {
+    if (contact.blocked || isBlocked(contact.phone)) { skipped++; continue; }
+    if (contact.profile.dmSentAt && (Date.now() - new Date(contact.profile.dmSentAt).getTime()) < cooldownMs) {
+      skipped++; continue;
+    }
+
+    try {
+      const jid = contact.id + '@c.us';
+      await acc.client.sendMessage(jid, message);
+      upsertCrmContact(contact.id, {
+        profile: { dmSent: true, dmSentAt: new Date().toISOString() },
+      });
+      sent++;
+      await new Promise(r => setTimeout(r, 3000));
+    } catch (err) {
+      console.error(`Bulk DM failed for ${contact.id}:`, err.message);
+      failed++;
+    }
+  }
+
+  saveCRM();
+
+  logBroadcast({
+    id: crypto.randomUUID(),
+    name: `List broadcast: ${req.params.id}`,
+    timestamp: new Date().toISOString(),
+    account: accountId,
+    chatIds: contacts.map(c => c.id + '@c.us'),
+    messagePreview: message.slice(0, 200),
+    sent, failed, skipped,
+    total: contacts.length,
+  });
+
+  res.json({ sent, skipped, failed, total: contacts.length });
+});
+
+// ─── Blocklist ──────────────────────────────────────────────────────────
+
+app.get('/api/whatsapp/blocklist', (req, res) => {
+  const blocklist = getBlocklist();
+  res.json({ blocklist });
+});
+
+app.post('/api/whatsapp/blocklist', (req, res) => {
+  const { phone, reason } = req.body;
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+
+  const blocklist = getBlocklist();
+  if (blocklist.find(b => b.phone === phone)) return res.status(409).json({ error: 'Already blocked' });
+
+  blocklist.push({ phone, reason: reason || null, blockedAt: new Date().toISOString() });
+  saveJSON(BLOCKLIST_FILE, blocklist);
+
+  const phoneId = phone.replace(/[^0-9]/g, '');
+  const contact = crmContacts.get(phoneId);
+  if (contact) {
+    contact.blocked = true;
+    contact.status = 'blocked';
+    crmDirty = true;
+    saveCRM();
+  }
+
+  res.json({ ok: true, blocked: phone });
+});
+
+app.delete('/api/whatsapp/blocklist/:phone', (req, res) => {
+  const blocklist = getBlocklist();
+  const filtered = blocklist.filter(b => b.phone !== req.params.phone);
+  if (filtered.length === blocklist.length) return res.status(404).json({ error: 'Not found in blocklist' });
+  saveJSON(BLOCKLIST_FILE, filtered);
+
+  const phoneId = req.params.phone.replace(/[^0-9]/g, '');
+  const contact = crmContacts.get(phoneId);
+  if (contact) {
+    contact.blocked = false;
+    crmDirty = true;
+    saveCRM();
+  }
+
+  res.json({ ok: true, unblocked: req.params.phone });
+});
+
 // ─── Start ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, '0.0.0.0', () => {
