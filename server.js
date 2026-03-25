@@ -233,14 +233,26 @@ try {
   }
 } catch (e) { console.log('Lock cleanup skipped:', e.message); }
 
+const DATA_DIR = fs.existsSync('/data') ? '/data/wwebjs_auth' : './wwebjs_auth';
+console.log('Session dir:', DATA_DIR);
+
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: '/data/wwebjs_auth' }),
+  authStrategy: new LocalAuth({ dataPath: DATA_DIR }),
   puppeteer: {
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-           '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
-           '--single-process', '--disable-gpu'],
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+      '--single-process', '--disable-gpu', '--disable-extensions',
+      '--disable-background-networking', '--disable-default-apps',
+      '--disable-sync', '--disable-translate', '--metrics-recording-only',
+      '--no-default-browser-check', '--mute-audio',
+      '--disable-component-update', '--disable-breakpad',
+      '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+      '--js-flags=--max-old-space-size=128 --gc-interval=100',
+    ],
   },
+  webVersionCache: { type: 'none' },
 });
 
 client.on('qr', (qr) => { currentQr = qr; clientStatus = 'waiting_for_qr_scan'; console.log('QR ready'); });
