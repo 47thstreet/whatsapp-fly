@@ -46,6 +46,161 @@ const TEMPLATES_FILE = path.join(DATA_DIR, 'templates.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const GROUP_TAGS_FILE = path.join(DATA_DIR, 'group-tags.json');
 const AUTO_RULES_FILE = path.join(DATA_DIR, 'auto-rules.json');
+const CONTACTS_FILE = path.join(DATA_DIR, 'contacts.json');
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const GROUP_STATS_FILE = path.join(DATA_DIR, 'group-stats.json');
+
+// ─── Cooldown System ─────────────────────────────────────────────────────
+const groupCooldowns = new Map(); // groupId -> timestamp
+
+function getCooldownMinutes() {
+  const settings = loadJSON(SETTINGS_FILE, {});
+  return settings.cooldownMinutes || parseInt(process.env.COOLDOWN_MINUTES) || 30;
+}
+
+function isCooldownActive(groupId) {
+  const last = groupCooldowns.get(groupId);
+  if (!last) return false;
+  const cooldownMs = getCooldownMinutes() * 60 * 1000;
+  return (Date.now() - last) < cooldownMs;
+}
+
+function setCooldown(groupId) {
+  groupCooldowns.set(groupId, Date.now());
+}
+
+// ─── Quiet Hours ─────────────────────────────────────────────────────────
+function getQuietHours() {
+  const settings = loadJSON(SETTINGS_FILE, {});
+  return {
+    start: settings.quietStart || process.env.QUIET_START || '02:00',
+    end: settings.quietEnd || process.env.QUIET_END || '10:00',
+  };
+}
+
+function isQuietHours() {
+  const { start, end } = getQuietHours();
+  const now = new Date();
+  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  const [sh, sm] = start.split(':').map(Number);
+  const [eh, em] = end.split(':').map(Number);
+  const startMin = sh * 60 + sm;
+  const endMin = eh * 60 + em;
+  if (startMin < endMin) {
+    return currentMinutes >= startMin && currentMinutes < endMin;
+  }
+  // Wraps midnight (e.g. 02:00 -> 10:00 doesn't wrap, but 22:00 -> 06:00 does)
+  return currentMinutes >= startMin || currentMinutes < endMin;
+}
+
+// ─── Group Stats ─────────────────────────────────────────────────────────
+function updateGroupStats(groupId, groupName, field) {
+  const stats = loadJSON(GROUP_STATS_FILE, {});
+  if (!stats[groupId]) {
+    stats[groupId] = { groupName, queriesDetected: 0, responseSent: 0, lastQueryAt: null, lastResponseAt: null };
+  }
+  stats[groupId].groupName = groupName || stats[groupId].groupName;
+  if (field === 'query') {
+    stats[groupId].queriesDetected++;
+    stats[groupId].lastQueryAt = new Date().toISOString();
+  } else if (field === 'response') {
+    stats[groupId].responseSent++;
+    stats[groupId].lastResponseAt = new Date().toISOString();
+  }
+  saveJSON(GROUP_STATS_FILE, stats);
+}
+
+// ─── Scanner Feed (ring buffer, last 100) ────────────────────────────────
+const scannerFeed = [];
+const MAX_FEED = 100;
+
+function addToFeed(entry) {
+  scannerFeed.unshift(entry);
+  if (scannerFeed.length > MAX_FEED) scannerFeed.length = MAX_FEED;
+}
+
+// ─── Contact Capture ─────────────────────────────────────────────────────
+function autoTagContact(message) {
+  const lower = message.toLowerCase();
+  if (/ticket|כרטיס|טיקט/.test(lower)) return 'tickets';
+  if (/table|שולחן/.test(lower)) return 'tables';
+  if (/vip/.test(lower)) return 'vip';
+  return 'general';
+}
+
+function captureContact(phoneNumber, name, message) {
+  const contacts = loadJSON(CONTACTS_FILE, []);
+  const existing = contacts.find(c => c.phone === phoneNumber);
+  const tag = autoTagContact(message);
+  if (existing) {
+    existing.name = name || existing.name;
+    existing.lastMessage = message;
+    existing.lastMessageAt = new Date().toISOString();
+    if (!existing.tags.includes(tag)) existing.tags.push(tag);
+  } else {
+    contacts.push({
+      id: crypto.randomUUID(),
+      phone: phoneNumber,
+      name: name || null,
+      firstMessage: message,
+      lastMessage: message,
+      tags: [tag],
+      capturedAt: new Date().toISOString(),
+      lastMessageAt: new Date().toISOString(),
+    });
+  }
+  saveJSON(CONTACTS_FILE, contacts);
+}
+
+// ─── Smart Chat Scanner — Intent Detection ───────────────────────────────
+
+const INTENT_PATTERNS_EN = [
+  /anyone\s+know\s+what.?s\s+happen/i,
+  /where\s+should\s+we\s+go\s+out/i,
+  /looking\s+for\s+something\s+fun/i,
+  /any\s+(events?|parties?|clubs?)\s*(happening|tonight|this|around)?/i,
+  /recommendations?\s+(for\s+)?(tonight|thursday|friday|saturday|this)/i,
+  /who.?s\s+going\s+out/i,
+  /what.?s\s+(going\s+on|happening)/i,
+  /where\s+can\s+i\s+buy\s+ticket/i,
+  /any\s+good\s+(clubs?|parties?|events?|places?)/i,
+  /want\s+to\s+go\s+out/i,
+  /let.?s\s+go\s+out/i,
+  /plans?\s+for\s+(tonight|this|the)/i,
+  /anything\s+happening/i,
+  /what\s+are\s+we\s+doing/i,
+  /where\s+to\s+go\s+(tonight|this|out)/i,
+  /what\s+to\s+do\s+(tonight|this)/i,
+];
+
+const INTENT_PATTERNS_HE = [
+  /מישה[וּ]?\s*יוד[עת]\s*מה\s*(יש|קורה)/,
+  /איפה\s*יוצאים/,
+  /מחפש[ת]?\s*משהו\s*(לעשות|כיף)/,
+  /יש\s*(אירועים|מסיבות|משהו)/,
+  /המלצות?\s*(ל|על)/,
+  /מי\s*יוצא/,
+  /מה\s*קורה\s*(ב|ה)?(סופש|סוף\s*שבוע|ערב)/,
+  /רוצ[הה]\s*לצאת/,
+  /בוא[וי]?\s*נצא/,
+  /תוכניות?\s*(ל|ה)?/,
+  /יש\s*משהו/,
+  /מה\s*עושים/,
+  /לאן\s*(הולכים|יוצאים|נלך)/,
+  /מה\s*יש\s*(ה)?ערב/,
+  /מה\s*יש\s*(ב)?(סופש|סוף\s*שבוע)/,
+];
+
+function isPartyIntent(message) {
+  const text = message.trim();
+  for (const re of INTENT_PATTERNS_EN) {
+    if (re.test(text)) return true;
+  }
+  for (const re of INTENT_PATTERNS_HE) {
+    if (re.test(text)) return true;
+  }
+  return false;
+}
 
 // ─── Event Recommender (standalone, no ClawdAgent) ───────────────────────
 
@@ -353,15 +508,53 @@ function setupClientEvents(accountId, client) {
       }
     }
 
-    // Default party keyword handler (existing behavior)
+    // Default party keyword handler (existing behavior + smart intent detection)
     if (chat.isGroup) {
-      const isPartyQuery = PARTY_KEYWORDS.some(kw => lower.includes(kw.toLowerCase()));
+      const keywordMatch = PARTY_KEYWORDS.some(kw => lower.includes(kw.toLowerCase()));
+      const intentMatch = isPartyIntent(msg.body);
+      const isPartyQuery = keywordMatch || intentMatch;
+
       if (isPartyQuery) {
-        console.log(`[${accountId}] Party keyword in group "${chat.name}" from ${msg.author || msg.from}`);
+        const groupId = chat.id._serialized;
+        const senderName = msg.author || msg.from;
+        console.log(`[${accountId}] Party ${intentMatch ? 'intent' : 'keyword'} in group "${chat.name}" from ${senderName}`);
+
+        // Track stats
+        updateGroupStats(groupId, chat.name, 'query');
+
+        // Check quiet hours
+        if (isQuietHours()) {
+          console.log(`[${accountId}] Skipping response — quiet hours active`);
+          addToFeed({
+            timestamp: new Date().toISOString(), groupName: chat.name, groupId,
+            senderName, message: msg.body.slice(0, 200), responded: false,
+            responsePreview: null, account: accountId,
+          });
+          return;
+        }
+
+        // Check cooldown
+        if (isCooldownActive(groupId)) {
+          console.log(`[${accountId}] Skipping response — cooldown active for "${chat.name}"`);
+          addToFeed({
+            timestamp: new Date().toISOString(), groupName: chat.name, groupId,
+            senderName, message: msg.body.slice(0, 200), responded: false,
+            responsePreview: null, account: accountId,
+          });
+          return;
+        }
+
         try {
           const recommendation = await getRecommendation(msg.body);
           await msg.reply(recommendation);
+          setCooldown(groupId);
+          updateGroupStats(groupId, chat.name, 'response');
           console.log(`[${accountId}] Replied with event recommendation`);
+          addToFeed({
+            timestamp: new Date().toISOString(), groupName: chat.name, groupId,
+            senderName, message: msg.body.slice(0, 200), responded: true,
+            responsePreview: recommendation.slice(0, 150), account: accountId,
+          });
         } catch (err) {
           console.error(`[${accountId}] Failed to reply:`, err.message);
           await msg.reply(
@@ -372,8 +565,15 @@ function setupClientEvents(accountId, client) {
       return;
     }
 
-    // In DMs: always respond with event info
+    // In DMs: capture contact + always respond with event info
     console.log(`[${accountId}] DM from ${msg.from}: ${msg.body.slice(0, 50)}...`);
+    try {
+      const contact = await msg.getContact().catch(() => null);
+      const contactName = contact ? (contact.pushname || contact.name || null) : null;
+      captureContact(msg.from, contactName, msg.body);
+    } catch (e) {
+      console.error(`[${accountId}] Contact capture failed:`, e.message);
+    }
     try {
       const recommendation = await getRecommendation(msg.body);
       await msg.reply(recommendation);
@@ -873,6 +1073,114 @@ app.delete('/api/whatsapp/auto-rules/:id', (req, res) => {
   if (filtered.length === rules.length) return res.status(404).json({ error: 'Rule not found' });
   saveJSON(AUTO_RULES_FILE, filtered);
   res.json({ ok: true, deleted: req.params.id });
+});
+
+// ─── Cooldown Endpoints ──────────────────────────────────────────────────
+
+app.get('/api/whatsapp/cooldowns', (req, res) => {
+  const cooldownMin = getCooldownMinutes();
+  const active = [];
+  for (const [groupId, ts] of groupCooldowns) {
+    const elapsed = Date.now() - ts;
+    const cooldownMs = cooldownMin * 60 * 1000;
+    if (elapsed < cooldownMs) {
+      active.push({
+        groupId,
+        lastResponseAt: new Date(ts).toISOString(),
+        expiresAt: new Date(ts + cooldownMs).toISOString(),
+        remainingSeconds: Math.round((cooldownMs - elapsed) / 1000),
+      });
+    }
+  }
+  res.json({ cooldowns: active, cooldownMinutes: cooldownMin });
+});
+
+app.post('/api/whatsapp/cooldowns/reset', (req, res) => {
+  const count = groupCooldowns.size;
+  groupCooldowns.clear();
+  console.log(`Cooldowns reset (cleared ${count} entries)`);
+  res.json({ ok: true, cleared: count });
+});
+
+// ─── Contact Endpoints ──────────────────────────────────────────────────
+
+app.get('/api/whatsapp/contacts', (req, res) => {
+  const contacts = loadJSON(CONTACTS_FILE, []);
+  res.json({ contacts });
+});
+
+app.get('/api/whatsapp/contacts/export', (req, res) => {
+  const contacts = loadJSON(CONTACTS_FILE, []);
+  const header = 'phone,name,tags,firstMessage,capturedAt,lastMessageAt';
+  const rows = contacts.map(c => {
+    const escape = (s) => `"${(s || '').replace(/"/g, '""')}"`;
+    return [escape(c.phone), escape(c.name), escape((c.tags || []).join(';')),
+            escape(c.firstMessage), escape(c.capturedAt), escape(c.lastMessageAt)].join(',');
+  });
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename=contacts.csv');
+  res.send([header, ...rows].join('\n'));
+});
+
+app.delete('/api/whatsapp/contacts/:id', (req, res) => {
+  const contacts = loadJSON(CONTACTS_FILE, []);
+  const filtered = contacts.filter(c => c.id !== req.params.id);
+  if (filtered.length === contacts.length) return res.status(404).json({ error: 'Contact not found' });
+  saveJSON(CONTACTS_FILE, filtered);
+  res.json({ ok: true, deleted: req.params.id });
+});
+
+// ─── Settings Endpoints (Quiet Hours, Cooldown) ─────────────────────────
+
+app.get('/api/whatsapp/settings', (req, res) => {
+  const settings = loadJSON(SETTINGS_FILE, {});
+  const { start, end } = getQuietHours();
+  res.json({
+    quietStart: start,
+    quietEnd: end,
+    cooldownMinutes: getCooldownMinutes(),
+    isQuietNow: isQuietHours(),
+    ...settings,
+  });
+});
+
+app.put('/api/whatsapp/settings', (req, res) => {
+  const settings = loadJSON(SETTINGS_FILE, {});
+  const { quietStart, quietEnd, cooldownMinutes } = req.body;
+  if (quietStart !== undefined) settings.quietStart = quietStart;
+  if (quietEnd !== undefined) settings.quietEnd = quietEnd;
+  if (cooldownMinutes !== undefined) settings.cooldownMinutes = Number(cooldownMinutes);
+  saveJSON(SETTINGS_FILE, settings);
+  res.json({ ok: true, settings });
+});
+
+// ─── Group Stats Endpoint ───────────────────────────────────────────────
+
+app.get('/api/whatsapp/groups/stats', (req, res) => {
+  const stats = loadJSON(GROUP_STATS_FILE, {});
+  const sorted = Object.entries(stats)
+    .map(([groupId, s]) => ({ groupId, ...s }))
+    .sort((a, b) => {
+      const aTime = a.lastQueryAt || a.lastResponseAt || '';
+      const bTime = b.lastQueryAt || b.lastResponseAt || '';
+      return bTime.localeCompare(aTime);
+    });
+  res.json({ stats: sorted });
+});
+
+// ─── Scanner Feed & Stats Endpoints ─────────────────────────────────────
+
+app.get('/api/whatsapp/scanner/feed', (req, res) => {
+  res.json({ feed: scannerFeed });
+});
+
+app.get('/api/whatsapp/scanner/stats', (req, res) => {
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayEntries = scannerFeed.filter(e => e.timestamp.startsWith(todayStr));
+  const totalQueries = todayEntries.length;
+  const totalResponses = todayEntries.filter(e => e.responded).length;
+  const activeGroups = new Set(todayEntries.map(e => e.groupId)).size;
+  res.json({ totalQueriesToday: totalQueries, totalResponsesToday: totalResponses, activeGroupsToday: activeGroups });
 });
 
 // ─── Start ───────────────────────────────────────────────────────────────
