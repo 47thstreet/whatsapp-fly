@@ -205,6 +205,34 @@ let currentQr = null;
 let clientReady = false;
 let clientStatus = 'initializing';
 
+// Clean stale Chrome lock files from persistent disk
+const fs = require('fs');
+const path = require('path');
+const sessionDir = '/data/wwebjs_auth';
+try {
+  const singletonLock = path.join(sessionDir, 'SingletonLock');
+  const singletonSocket = path.join(sessionDir, 'SingletonSocket');
+  const singletonCookie = path.join(sessionDir, 'SingletonCookie');
+  [singletonLock, singletonSocket, singletonCookie].forEach(f => {
+    try { fs.unlinkSync(f); console.log('Removed stale lock:', f); } catch {}
+  });
+  // Also clean locks inside session subdirs
+  if (fs.existsSync(sessionDir)) {
+    const walk = (dir) => {
+      try {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else if (entry.name.startsWith('Singleton')) {
+            try { fs.unlinkSync(full); console.log('Removed stale lock:', full); } catch {}
+          }
+        }
+      } catch {}
+    };
+    walk(sessionDir);
+  }
+} catch (e) { console.log('Lock cleanup skipped:', e.message); }
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: '/data/wwebjs_auth' }),
   puppeteer: {
@@ -212,7 +240,6 @@ const client = new Client({
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
            '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
            '--single-process', '--disable-gpu'],
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
   },
 });
 
