@@ -1,12 +1,10 @@
 FROM node:20-slim
 
-# Install Chromium and all dependencies for Puppeteer/whatsapp-web.js
+# Install system deps needed by Puppeteer's bundled Chromium
 RUN apt-get update && apt-get install -y \
-    chromium \
     ca-certificates \
     fonts-liberation \
     fonts-noto-color-emoji \
-    libappindicator3-1 \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -27,18 +25,17 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libxss1 \
     xdg-utils \
+    wget \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Find actual chromium binary path (varies by distro)
-RUN which chromium || which chromium-browser || echo "/usr/bin/chromium"
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# Let Puppeteer download its own Chromium (most reliable)
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
 
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install --production
+RUN npm install
 
 COPY server.js ./
 
