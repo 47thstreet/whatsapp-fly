@@ -244,7 +244,7 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => { currentQr = qr; clientStatus = 'waiting_for_qr_scan'; console.log('QR ready'); });
-client.on('ready', () => { currentQr = null; clientReady = true; clientStatus = 'connected'; console.log('WhatsApp connected!'); });
+client.on('ready', () => { currentQr = null; clientReady = true; clientStatus = 'ready'; console.log('WhatsApp connected!'); });
 client.on('authenticated', () => { clientStatus = 'authenticated'; console.log('WhatsApp authenticated'); });
 client.on('auth_failure', (msg) => { clientReady = false; clientStatus = 'auth_failure'; console.error('Auth fail:', msg); });
 client.on('disconnected', (reason) => {
@@ -322,11 +322,12 @@ app.get('/api/whatsapp/status', (req, res) => {
 });
 
 app.get('/api/whatsapp/qr', async (req, res) => {
-  if (clientReady) return res.json({ qr: null, message: 'Already connected' });
-  if (!currentQr) return res.json({ qr: null, message: 'No QR yet, status: ' + clientStatus });
+  if (clientReady) return res.json({ qr: null, status: 'ready', message: 'Already connected' });
+  if (clientStatus === 'authenticated') return res.json({ qr: null, status: 'authenticated', message: 'Authenticated, loading...' });
+  if (!currentQr) return res.json({ qr: null, status: clientStatus, message: 'No QR yet, status: ' + clientStatus });
   try {
     const qrDataUrl = await qrcode.toDataURL(currentQr);
-    res.json({ qr: qrDataUrl, qrDataUrl }); // both keys for compat
+    res.json({ qr: qrDataUrl, qrDataUrl, status: clientStatus });
   } catch { res.status(500).json({ error: 'QR generation failed' }); }
 });
 
