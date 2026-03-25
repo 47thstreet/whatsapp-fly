@@ -269,8 +269,22 @@ client.on('message', async (msg) => {
   }
 });
 
-console.log('Initializing WhatsApp client...');
-client.initialize().catch(err => { console.error('Init failed:', err.message); clientStatus = 'error'; });
+async function initWhatsApp(attempt = 1) {
+  console.log(`Initializing WhatsApp client (attempt ${attempt})...`);
+  try {
+    await client.initialize();
+  } catch (err) {
+    console.error(`Init failed (attempt ${attempt}):`, err.message, err.stack);
+    clientStatus = 'error';
+    if (attempt < 3) {
+      console.log(`Retrying in 10s...`);
+      setTimeout(() => initWhatsApp(attempt + 1), 10000);
+    } else {
+      console.error('All init attempts failed. Check Chromium installation.');
+    }
+  }
+}
+initWhatsApp();
 
 // ─── API Routes ──────────────────────────────────────────────────────────
 
