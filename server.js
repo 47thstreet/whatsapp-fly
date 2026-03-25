@@ -1,5 +1,5 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 
@@ -173,12 +173,28 @@ app.use((req, res, next) => {
   next();
 });
 
+function verifyJWT(token, secret) {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Bad token format');
+  const [header, payload, sig] = parts;
+  // Verify signature using raw HMAC (matches the Vercel proxy's makeToken)
+  const expected = crypto.createHmac('sha256', secret)
+    .update(header + '.' + payload)
+    .digest('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  if (sig !== expected) throw new Error('Signature mismatch');
+  // Decode payload
+  const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString());
+  if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) throw new Error('Expired');
+  return decoded;
+}
+
 function authMiddleware(req, res, next) {
   if (req.path === '/health') return next();
   const h = req.headers.authorization;
   if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing auth' });
-  try { req.user = jwt.verify(h.slice(7), JWT_SECRET); next(); }
-  catch { return res.status(401).json({ error: 'Invalid token' }); }
+  try { req.user = verifyJWT(h.slice(7), JWT_SECRET); next(); }
+  catch (e) { return res.status(401).json({ error: 'Invalid token', detail: e.message }); }
 }
 
 app.use(authMiddleware);
