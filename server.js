@@ -4,6 +4,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
 const leads = require('./leads');
 
 const app = express();
@@ -53,6 +54,7 @@ const GROUP_STATS_FILE = path.join(DATA_DIR, 'group-stats.json');
 const CRM_FILE = path.join(DATA_DIR, 'crm.json');
 const BLOCKLIST_FILE = path.join(DATA_DIR, 'blocklist.json');
 const LISTS_FILE = path.join(DATA_DIR, 'lists.json');
+const BROADCAST_LISTS_FILE = path.join(DATA_DIR, 'broadcast-lists.json');
 
 // ─── Cooldown System ─────────────────────────────────────────────────────
 const groupCooldowns = new Map(); // groupId -> timestamp
@@ -164,6 +166,154 @@ function formatPhone(id) {
   // Ensure phone starts with +
   const num = id.replace(/[^0-9]/g, '');
   return '+' + num;
+}
+
+// ─── Multer Upload (for CSV file import) ─────────────────────────────────
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// ─── Phone Number Normalization ──────────────────────────────────────────
+function normalizePhone(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  // Strip spaces, dashes, parentheses, dots
+  let phone = raw.replace(/[\s\-\(\)\.]/g, '').trim();
+  if (!phone) return null;
+  // If starts with +, keep it; otherwise add default +
+  if (!phone.startsWith('+')) {
+    // If looks like a full international number (10+ digits), prepend +
+    const digits = phone.replace(/[^0-9]/g, '');
+    if (digits.length >= 10) {
+      phone = '+' + digits;
+    } else {
+      return null; // too short to be valid
+    }
+  }
+  // Final cleanup: only digits after +
+  const cleaned = '+' + phone.slice(1).replace(/[^0-9]/g, '');
+  if (cleaned.length < 8) return null; // too short
+  return cleaned;
+}
+
+// ─── CSV Parsing Helper ─────────────────────────────────────────────────
+function parseCSV(csvText) {
+  const lines = csvText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim());
+  if (lines.length < 2) return { rows: [], errors: ['CSV must have a header row and at least one data row'] };
+
+  // Parse header
+  const header = parseCSVLine(lines[0]).map(h => h.trim().toLowerCase());
+  const phoneIdx = header.findIndex(h => h === 'phone' || h === 'phone_number' || h === 'phonenumber' || h === 'mobile' || h === 'number');
+  const nameIdx = header.findIndex(h => h === 'name' || h === 'full_name' || h === 'fullname' || h === 'contact_name');
+  const tagsIdx = header.findIndex(h => h === 'tags' || h === 'tag' || h === 'labels' || h === 'label');
+
+  if (phoneIdx === -1) return { rows: [], errors: ['CSV must have a "phone" column'] };
+
+  const rows = [];
+  const errors = [];
+  for (let i = 1; i < lines.length; i++) {
+    const fields = parseCSVLine(lines[i]);
+    const phone = fields[phoneIdx] ? fields[phoneIdx].trim() : '';
+    const name = nameIdx >= 0 && fields[nameIdx] ? fields[nameIdx].trim() : null;
+    const tagsRaw = tagsIdx >= 0 && fields[tagsIdx] ? fields[tagsIdx].trim() : '';
+    const tags = tagsRaw ? tagsRaw.split(';').map(t => t.trim()).filter(Boolean) : [];
+
+    if (!phone) {
+      errors.push(`Row ${i + 1}: empty phone number`);
+      continue;
+    }
+
+    const normalized = normalizePhone(phone);
+    if (!normalized) {
+      errors.push(`Row ${i + 1}: invalid phone "${phone}"`);
+      continue;
+    }
+
+    rows.push({ phone: normalized, name, tags });
+  }
+
+  return { rows, errors };
+}
+
+function parseCSVLine(line) {
+  const fields = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < line.length && line[i + 1] === '"') {
+          current += '"';
+          i++; // skip escaped quote
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ',') {
+        fields.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+  }
+  fields.push(current);
+  return fields;
+}
+
+// ─── CSV Contact Import Logic ───────────────────────────────────────────
+function importCSVContacts(csvText, source) {
+  const { rows, errors } = parseCSV(csvText);
+  let imported = 0, newCount = 0, updated = 0, skipped = 0;
+
+  for (const row of rows) {
+    const phoneId = row.phone.replace(/[^0-9]/g, '');
+    if (!phoneId || phoneId.length < 5) { skipped++; continue; }
+    if (isBlocked(row.phone)) { skipped++; continue; }
+
+    const existing = crmContacts.has(phoneId);
+    const tags = [...row.tags];
+    if (source) tags.push(`import:${source}`);
+
+    upsertCrmContact(phoneId, {
+      name: row.name,
+      tags,
+      source: { type: 'csv_import', importSource: source || 'manual', firstSeen: new Date().toISOString() },
+      profile: { lastActive: new Date().toISOString() },
+    });
+
+    imported++;
+    if (existing) updated++;
+    else newCount++;
+  }
+
+  saveCRM();
+  return { imported, new: newCount, updated, skipped, errors };
+}
+
+// ─── Broadcast Lists In-Memory Store ────────────────────────────────────
+let broadcastLists = [];
+let broadcastListsDirty = false;
+
+function loadBroadcastLists() {
+  broadcastLists = loadJSON(BROADCAST_LISTS_FILE, []);
+  console.log(`Broadcast lists loaded: ${broadcastLists.length}`);
+}
+
+function saveBroadcastLists() {
+  if (!broadcastListsDirty) return;
+  saveJSON(BROADCAST_LISTS_FILE, broadcastLists);
+  broadcastListsDirty = false;
+}
+
+// Flush broadcast lists every 30 seconds
+setInterval(saveBroadcastLists, 30000);
+
+function getBroadcastList(id) {
+  return broadcastLists.find(l => l.id === id) || null;
 }
 
 function calculateScore(contact) {
@@ -1989,6 +2139,401 @@ app.delete('/api/whatsapp/blocklist/:phone', (req, res) => {
   res.json({ ok: true, unblocked: req.params.phone });
 });
 
+// ─── CSV Contact Import ─────────────────────────────────────────────────
+
+app.post('/api/whatsapp/contacts/import', (req, res) => {
+  const { csv, source } = req.body;
+  if (!csv || typeof csv !== 'string') return res.status(400).json({ error: 'csv string required' });
+
+  try {
+    const result = importCSVContacts(csv, source || null);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/whatsapp/contacts/import-file', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'CSV file required (field name: "file")' });
+
+  const csvText = req.file.buffer.toString('utf-8');
+  const source = req.body.source || null;
+
+  try {
+    const result = importCSVContacts(csvText, source);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Internal Broadcast Lists ───────────────────────────────────────────
+
+app.post('/api/whatsapp/broadcast-lists', (req, res) => {
+  const { name, description, contacts, tags } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+
+  const id = 'list_' + crypto.randomUUID().slice(0, 12);
+  const phones = (contacts || []).map(p => normalizePhone(p)).filter(Boolean);
+  const dedupedPhones = [...new Set(phones)];
+
+  const list = {
+    id,
+    name,
+    description: description || '',
+    contacts: dedupedPhones,
+    tags: tags || [],
+    createdAt: new Date().toISOString(),
+    lastBroadcastAt: null,
+    broadcastCount: 0,
+  };
+
+  broadcastLists.push(list);
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+
+  res.json({ ok: true, list: { ...list, contactCount: list.contacts.length } });
+});
+
+app.get('/api/whatsapp/broadcast-lists', (req, res) => {
+  const result = broadcastLists.map(l => ({
+    id: l.id,
+    name: l.name,
+    description: l.description,
+    tags: l.tags,
+    contactCount: l.contacts.length,
+    createdAt: l.createdAt,
+    lastBroadcastAt: l.lastBroadcastAt,
+    broadcastCount: l.broadcastCount,
+  }));
+  res.json({ lists: result });
+});
+
+// ─── List Building from Filters ─────────────────────────────────────────
+
+app.post('/api/whatsapp/broadcast-lists/from-filter', (req, res) => {
+  const { name, filters } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!filters || typeof filters !== 'object') return res.status(400).json({ error: 'filters object required' });
+
+  let contactList = Array.from(crmContacts.values()).map(c => {
+    c.score = calculateScore(c);
+    c.status = c.blocked ? 'blocked' : statusFromScore(c.score);
+    return c;
+  });
+
+  // Filter by status
+  if (filters.status) {
+    const statuses = Array.isArray(filters.status) ? filters.status : [filters.status];
+    contactList = contactList.filter(c => statuses.includes(c.status));
+  }
+
+  // Filter by tags (match any)
+  if (filters.tags && Array.isArray(filters.tags) && filters.tags.length > 0) {
+    const wantedTags = filters.tags.map(t => t.toLowerCase());
+    contactList = contactList.filter(c =>
+      c.tags.some(t => wantedTags.includes(t.toLowerCase()))
+    );
+  }
+
+  // Filter by list membership
+  if (filters.list) {
+    contactList = contactList.filter(c => c.lists.includes(filters.list));
+  }
+
+  // Filter by source
+  if (filters.source) {
+    contactList = contactList.filter(c =>
+      c.source && (c.source.type === filters.source || c.source.groupName === filters.source)
+    );
+  }
+
+  // Filter by minimum score
+  if (filters.minScore !== undefined) {
+    contactList = contactList.filter(c => (c.score || 0) >= filters.minScore);
+  }
+
+  // Exclude blocked
+  contactList = contactList.filter(c => !c.blocked);
+
+  const phones = contactList.map(c => formatPhone(c.id));
+  const dedupedPhones = [...new Set(phones)];
+
+  const id = 'list_' + crypto.randomUUID().slice(0, 12);
+  const list = {
+    id,
+    name,
+    description: `Auto-created from filter: ${JSON.stringify(filters)}`,
+    contacts: dedupedPhones,
+    tags: filters.tags || [],
+    createdAt: new Date().toISOString(),
+    lastBroadcastAt: null,
+    broadcastCount: 0,
+  };
+
+  broadcastLists.push(list);
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+
+  res.json({ ok: true, list: { ...list, contactCount: list.contacts.length } });
+});
+
+// ─── Merge Broadcast Lists ──────────────────────────────────────────────
+
+app.post('/api/whatsapp/broadcast-lists/merge', (req, res) => {
+  const { listIds, name } = req.body;
+  if (!listIds || !Array.isArray(listIds) || listIds.length < 2) {
+    return res.status(400).json({ error: 'listIds array with at least 2 IDs required' });
+  }
+  if (!name) return res.status(400).json({ error: 'name required' });
+
+  const allPhones = new Set();
+  const allTags = new Set();
+  const missing = [];
+
+  for (const lid of listIds) {
+    const list = getBroadcastList(lid);
+    if (!list) { missing.push(lid); continue; }
+    for (const phone of list.contacts) allPhones.add(phone);
+    for (const tag of (list.tags || [])) allTags.add(tag);
+  }
+
+  if (missing.length > 0) {
+    return res.status(404).json({ error: `Lists not found: ${missing.join(', ')}` });
+  }
+
+  const id = 'list_' + crypto.randomUUID().slice(0, 12);
+  const merged = {
+    id,
+    name,
+    description: `Merged from: ${listIds.join(', ')}`,
+    contacts: Array.from(allPhones),
+    tags: Array.from(allTags),
+    createdAt: new Date().toISOString(),
+    lastBroadcastAt: null,
+    broadcastCount: 0,
+  };
+
+  broadcastLists.push(merged);
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+
+  res.json({ ok: true, list: { ...merged, contactCount: merged.contacts.length } });
+});
+
+app.get('/api/whatsapp/broadcast-lists/:id', (req, res) => {
+  const list = getBroadcastList(req.params.id);
+  if (!list) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  // Enrich contacts with CRM data
+  const enriched = list.contacts.map(phone => {
+    const phoneId = phone.replace(/[^0-9]/g, '');
+    const contact = getCrmContact(phoneId);
+    return {
+      phone,
+      name: contact ? (contact.name || contact.pushName || null) : null,
+      status: contact ? contact.status : 'unknown',
+      score: contact ? contact.score : 0,
+    };
+  });
+
+  res.json({ list: { ...list, contactCount: list.contacts.length }, contacts: enriched });
+});
+
+app.put('/api/whatsapp/broadcast-lists/:id', (req, res) => {
+  const list = getBroadcastList(req.params.id);
+  if (!list) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  const { name, description, tags } = req.body;
+  if (name !== undefined) list.name = name;
+  if (description !== undefined) list.description = description;
+  if (tags !== undefined) list.tags = tags;
+
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+  res.json({ ok: true, list: { ...list, contactCount: list.contacts.length } });
+});
+
+app.delete('/api/whatsapp/broadcast-lists/:id', (req, res) => {
+  const idx = broadcastLists.findIndex(l => l.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  const deleted = broadcastLists.splice(idx, 1)[0];
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+  res.json({ ok: true, deleted: deleted.id });
+});
+
+app.post('/api/whatsapp/broadcast-lists/:id/contacts', (req, res) => {
+  const list = getBroadcastList(req.params.id);
+  if (!list) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  const { phones } = req.body;
+  if (!phones || !Array.isArray(phones)) return res.status(400).json({ error: 'phones array required' });
+
+  let added = 0;
+  for (const raw of phones) {
+    const phone = normalizePhone(raw);
+    if (phone && !list.contacts.includes(phone)) {
+      list.contacts.push(phone);
+      added++;
+    }
+  }
+
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+  res.json({ ok: true, added, contactCount: list.contacts.length });
+});
+
+app.delete('/api/whatsapp/broadcast-lists/:id/contacts', (req, res) => {
+  const list = getBroadcastList(req.params.id);
+  if (!list) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  const { phones } = req.body;
+  if (!phones || !Array.isArray(phones)) return res.status(400).json({ error: 'phones array required' });
+
+  let removed = 0;
+  for (const raw of phones) {
+    const phone = normalizePhone(raw);
+    if (!phone) continue;
+    const idx = list.contacts.indexOf(phone);
+    if (idx >= 0) {
+      list.contacts.splice(idx, 1);
+      removed++;
+    }
+  }
+
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+  res.json({ ok: true, removed, contactCount: list.contacts.length });
+});
+
+app.post('/api/whatsapp/broadcast-lists/:id/import', (req, res) => {
+  const list = getBroadcastList(req.params.id);
+  if (!list) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  const { csv, source } = req.body;
+  if (!csv || typeof csv !== 'string') return res.status(400).json({ error: 'csv string required' });
+
+  try {
+    // First import into CRM
+    const crmResult = importCSVContacts(csv, source || null);
+
+    // Then add phones to broadcast list
+    const { rows } = parseCSV(csv);
+    let added = 0;
+    for (const row of rows) {
+      if (row.phone && !list.contacts.includes(row.phone)) {
+        list.contacts.push(row.phone);
+        added++;
+      }
+    }
+
+    broadcastListsDirty = true;
+    saveBroadcastLists();
+
+    res.json({
+      ...crmResult,
+      addedToList: added,
+      contactCount: list.contacts.length,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Bulk DM via Broadcast List ─────────────────────────────────────────
+
+app.post('/api/whatsapp/broadcast-lists/:id/send', async (req, res) => {
+  const list = getBroadcastList(req.params.id);
+  if (!list) return res.status(404).json({ error: 'Broadcast list not found' });
+
+  const { message, account } = req.body;
+  if (!message) return res.status(400).json({ error: 'message required' });
+
+  const accountId = account || 'default';
+  const acc = accounts.get(accountId);
+  if (!acc || !acc.ready) return res.status(503).json({ error: 'Account not ready' });
+
+  const settings = getCrmSettings();
+  const cooldownMs = settings.autoDmCooldownHours * 60 * 60 * 1000;
+  const blocklist = getBlocklist();
+
+  let sent = 0, skipped = 0, failed = 0;
+  const total = list.contacts.length;
+
+  for (const phone of list.contacts) {
+    // Check blocked
+    if (blocklist.some(b => b.phone === phone)) { skipped++; continue; }
+
+    const phoneId = phone.replace(/[^0-9]/g, '');
+    const crmContact = getCrmContact(phoneId);
+
+    // Check blocked in CRM
+    if (crmContact && crmContact.blocked) { skipped++; continue; }
+
+    // Check per-contact cooldown
+    if (crmContact && crmContact.profile.dmSentAt) {
+      if ((Date.now() - new Date(crmContact.profile.dmSentAt).getTime()) < cooldownMs) {
+        skipped++; continue;
+      }
+    }
+
+    // Build personalized message
+    let personalMsg = message;
+    const contactName = crmContact ? (crmContact.name || crmContact.pushName || 'there') : 'there';
+    personalMsg = personalMsg.replace(/\{name\}/g, contactName);
+
+    // Replace {events} if present
+    if (personalMsg.includes('{events}')) {
+      try {
+        const recommendation = await getRecommendation('upcoming events');
+        personalMsg = personalMsg.replace(/\{events\}/g, recommendation);
+      } catch {
+        personalMsg = personalMsg.replace(/\{events\}/g, `Check out events at ${TBP_URL}/events`);
+      }
+    }
+
+    try {
+      const jid = phoneId + '@c.us';
+      await acc.client.sendMessage(jid, personalMsg);
+
+      // Update CRM
+      upsertCrmContact(phoneId, {
+        profile: { dmSent: true, dmSentAt: new Date().toISOString() },
+      });
+
+      sent++;
+      // 3-second delay between sends
+      if (sent < total) await new Promise(r => setTimeout(r, 3000));
+    } catch (err) {
+      console.error(`Broadcast list DM failed for ${phone}:`, err.message);
+      failed++;
+    }
+  }
+
+  saveCRM();
+
+  // Update list broadcast stats
+  list.lastBroadcastAt = new Date().toISOString();
+  list.broadcastCount = (list.broadcastCount || 0) + 1;
+  broadcastListsDirty = true;
+  saveBroadcastLists();
+
+  // Log to broadcast history
+  logBroadcast({
+    id: crypto.randomUUID(),
+    name: `Broadcast list: ${list.name}`,
+    timestamp: new Date().toISOString(),
+    account: accountId,
+    chatIds: list.contacts.map(p => p.replace(/[^0-9]/g, '') + '@c.us'),
+    messagePreview: message.slice(0, 200),
+    sent, failed, skipped, total,
+  });
+
+  res.json({ sent, skipped, failed, total });
+});
+
 // ─── Start ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -1997,6 +2542,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`TBP URL: ${TBP_URL}`);
   leads.initLeads(DATA_DIR);
   loadCRM();
+  loadBroadcastLists();
   loadAndInitAccounts();
   startScrapeSchedule();
   // Initial scrape 60s after startup (give clients time to connect)
