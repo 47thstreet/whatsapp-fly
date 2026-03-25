@@ -6,17 +6,165 @@ const qrcode = require('qrcode');
 const app = express();
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET;
+const KARTIS_EVENTS_URL = process.env.KARTIS_EVENTS_URL || 'https://kartis-astro.vercel.app/api/cms/public-events';
+const TBP_URL = process.env.TBP_URL || 'https://tbp-website-astro.vercel.app';
 
 if (!JWT_SECRET) {
   console.error('FATAL: JWT_SECRET environment variable is required');
   process.exit(1);
 }
 
-// --- Middleware ---
+// ─── Event Recommender (standalone, no ClawdAgent) ───────────────────────
+
+let cachedEvents = [];
+let cacheTimestamp = 0;
+const CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+async function fetchEvents() {
+  if (Date.now() - cacheTimestamp < CACHE_TTL && cachedEvents.length > 0) {
+    return cachedEvents;
+  }
+  try {
+    const res = await fetch(KARTIS_EVENTS_URL, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    cachedEvents = Array.isArray(data) ? data : [];
+    cacheTimestamp = Date.now();
+    console.log(`Fetched ${cachedEvents.length} events from Kartis`);
+    return cachedEvents;
+  } catch (err) {
+    console.error('Failed to fetch events:', err.message);
+    return cachedEvents; // stale cache
+  }
+}
+
+function getUpcoming(events) {
+  const now = new Date();
+  return events
+    .filter(e => { try { return new Date(e.date) >= now; } catch { return false; } })
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+function isHebrew(text) { return /[\u0590-\u05FF]/.test(text); }
+
+function formatEvent(e, heb) {
+  const lines = [];
+  try {
+    const d = new Date(e.date);
+    const dateStr = d.toLocaleDateString(heb ? 'he-IL' : 'en-US', { weekday: 'short', day: 'numeric', month: 'short' });
+    lines.push(`*${e.name}*`);
+    lines.push(`📅 ${dateStr}${e.time ? ' | ' + e.time : ''}`);
+  } catch {
+    lines.push(`*${e.name}*`);
+  }
+  if (e.venue) lines.push(`📍 ${e.venue}${e.location ? ', ' + e.location : ''}`);
+  if (e.price) lines.push(`💰 ${e.price}`);
+  if (e.ticketUrl) lines.push(`🎟️ ${e.ticketUrl}`);
+  return lines.join('\n');
+}
+
+const DAY_MAP = {
+  sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
+  'ראשון': 0, 'שני': 1, 'שלישי': 2, 'רביעי': 3, 'חמישי': 4, 'שישי': 5, 'שבת': 6,
+};
+
+async function getRecommendation(userMessage) {
+  const events = await fetchEvents();
+  const upcoming = getUpcoming(events);
+  const heb = isHebrew(userMessage);
+  const lower = userMessage.toLowerCase();
+
+  let matched = [];
+
+  // Today/tonight
+  if (lower.includes('tonight') || lower.includes('today') || lower.includes('הערב') || lower.includes('היום')) {
+    const today = new Date().toISOString().slice(0, 10);
+    matched = upcoming.filter(e => e.date?.startsWith(today));
+  }
+  // Weekend
+  else if (lower.includes('weekend') || lower.includes('סוף שבוע') || lower.includes('סופש')) {
+    const now = new Date();
+    const day = now.getDay();
+    const thu = new Date(now); thu.setDate(now.getDate() + ((4 - day + 7) % 7));
+    const sun = new Date(now); sun.setDate(now.getDate() + ((0 - day + 7) % 7) + 7);
+    matched = upcoming.filter(e => {
+      try { const d = new Date(e.date); return d >= thu && d <= sun; } catch { return false; }
+    });
+  }
+  // Specific day
+  else {
+    for (const [kw, dayNum] of Object.entries(DAY_MAP)) {
+      if (lower.includes(kw)) {
+        const now = new Date();
+        const ahead = (dayNum - now.getDay() + 7) % 7 || 7;
+        const target = new Date(now); target.setDate(now.getDate() + ahead);
+        const targetStr = target.toISOString().slice(0, 10);
+        matched = upcoming.filter(e => e.date?.startsWith(targetStr));
+        break;
+      }
+    }
+  }
+
+  // Keyword search fallback
+  if (matched.length === 0) {
+    const terms = lower.replace(/[^\w\u0590-\u05FF\s]/g, '').split(/\s+/).filter(w => w.length > 2);
+    matched = upcoming.filter(e => {
+      const hay = `${e.name} ${e.description || ''} ${e.venue || ''}`.toLowerCase();
+      return terms.some(t => hay.includes(t));
+    });
+  }
+
+  const header = '🎉 *The Best Parties*\n\n';
+
+  if (matched.length > 0) {
+    const list = matched.slice(0, 3).map(e => formatEvent(e, heb)).join('\n\n');
+    const footer = heb
+      ? `\n\n_כל האירועים_ ➡️ ${TBP_URL}/events`
+      : `\n\nAll events ➡️ ${TBP_URL}/events`;
+    return header + list + footer;
+  }
+
+  if (upcoming.length > 0) {
+    const intro = heb ? '🔥 הנה מה שבקרוב:\n\n' : "🔥 Here's what's coming up:\n\n";
+    const list = upcoming.slice(0, 3).map(e => formatEvent(e, heb)).join('\n\n');
+    const footer = heb
+      ? `\n\n_כל האירועים_ ➡️ ${TBP_URL}/events`
+      : `\n\nAll events ➡️ ${TBP_URL}/events`;
+    return header + intro + list + footer;
+  }
+
+  return heb
+    ? '🎉 *The Best Parties*\n\nאין אירועים קרובים כרגע.\nעקבו ➡️ ' + TBP_URL
+    : '🎉 *The Best Parties*\n\nNo upcoming events right now.\nStay tuned ➡️ ' + TBP_URL;
+}
+
+async function formatEventsForBroadcast(max = 5) {
+  const events = await fetchEvents();
+  const upcoming = getUpcoming(events);
+  if (upcoming.length === 0) return '🎉 *The Best Parties*\n\nNo upcoming events.';
+  const list = upcoming.slice(0, max).map(e => formatEvent(e, true)).join('\n\n');
+  return `🎉 *The Best Parties — אירועים קרובים*\n\n${list}\n\n_כל האירועים_ ➡️ ${TBP_URL}/events`;
+}
+
+// ─── Party keywords for auto-response ────────────────────────────────────
+
+const PARTY_KEYWORDS = [
+  // English
+  'ticket', 'tickets', 'how much', 'buy ticket', 'where to buy',
+  'party', 'event', 'tonight', 'this weekend', 'thursday', 'friday', 'saturday',
+  'club', 'nightlife', 'table', 'vip', 'bottle', 'guestlist', 'guest list', 'rsvp',
+  'thebestparties', 'kartis', 'tbp',
+  // Hebrew
+  'כרטיס', 'כרטיסים', 'טיקט', 'טיקטים', 'כמה עולה', 'כמה זה עולה',
+  'מסיבה', 'מסיבות', 'אירוע', 'אירועים', 'הערב', 'סוף שבוע', 'סופש',
+  'מועדון', 'שולחן', 'בקבוק', 'רשימת אורחים',
+  'איפה קונים', 'איפה אפשר', 'קנות כרטיס', 'לקנות כרטיס',
+];
+
+// ─── Express Middleware ──────────────────────────────────────────────────
 
 app.use(express.json());
 
-// CORS for Vercel frontend
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -25,187 +173,174 @@ app.use((req, res, next) => {
   next();
 });
 
-// JWT auth (skip for /health)
 function authMiddleware(req, res, next) {
   if (req.path === '/health') return next();
-
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
-  }
-
-  try {
-    const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
+  const h = req.headers.authorization;
+  if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing auth' });
+  try { req.user = jwt.verify(h.slice(7), JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
 app.use(authMiddleware);
 
-// --- WhatsApp Client ---
+// ─── WhatsApp Client ─────────────────────────────────────────────────────
 
 let currentQr = null;
 let clientReady = false;
 let clientStatus = 'initializing';
 
 const client = new Client({
-  authStrategy: new LocalAuth({
-    dataPath: '/data/wwebjs_auth',
-  }),
+  authStrategy: new LocalAuth({ dataPath: '/data/wwebjs_auth' }),
   puppeteer: {
     headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu',
-    ],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+           '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+           '--single-process', '--disable-gpu'],
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
   },
 });
 
-client.on('qr', (qr) => {
-  currentQr = qr;
-  clientStatus = 'waiting_for_qr_scan';
-  console.log('QR code received, waiting for scan...');
-});
-
-client.on('ready', () => {
-  currentQr = null;
-  clientReady = true;
-  clientStatus = 'connected';
-  console.log('WhatsApp client is ready!');
-});
-
-client.on('authenticated', () => {
-  console.log('WhatsApp client authenticated');
-  clientStatus = 'authenticated';
-});
-
-client.on('auth_failure', (msg) => {
-  console.error('WhatsApp auth failure:', msg);
-  clientReady = false;
-  clientStatus = 'auth_failure';
-});
-
+client.on('qr', (qr) => { currentQr = qr; clientStatus = 'waiting_for_qr_scan'; console.log('QR ready'); });
+client.on('ready', () => { currentQr = null; clientReady = true; clientStatus = 'connected'; console.log('WhatsApp connected!'); });
+client.on('authenticated', () => { clientStatus = 'authenticated'; console.log('WhatsApp authenticated'); });
+client.on('auth_failure', (msg) => { clientReady = false; clientStatus = 'auth_failure'; console.error('Auth fail:', msg); });
 client.on('disconnected', (reason) => {
-  console.log('WhatsApp client disconnected:', reason);
-  clientReady = false;
-  clientStatus = 'disconnected';
-  currentQr = null;
-  // Attempt to reconnect
-  setTimeout(() => {
-    console.log('Attempting to reconnect...');
-    client.initialize().catch(err => {
-      console.error('Reconnection failed:', err.message);
-    });
-  }, 5000);
+  clientReady = false; clientStatus = 'disconnected'; currentQr = null;
+  console.log('Disconnected:', reason);
+  setTimeout(() => client.initialize().catch(e => console.error('Reconnect fail:', e.message)), 5000);
 });
 
-// Initialize the client
+// ─── Standalone Group Chat Bot (no ClawdAgent) ──────────────────────────
+
+client.on('message', async (msg) => {
+  if (msg.fromMe) return;
+
+  const chat = await msg.getChat().catch(() => null);
+  if (!chat) return;
+
+  // In group chats: respond to party keywords
+  if (chat.isGroup) {
+    const lower = msg.body.toLowerCase();
+    const isPartyQuery = PARTY_KEYWORDS.some(kw => lower.includes(kw.toLowerCase()));
+
+    if (isPartyQuery) {
+      console.log(`[BOT] Party keyword in group "${chat.name}" from ${msg.author || msg.from}`);
+      try {
+        const recommendation = await getRecommendation(msg.body);
+        await msg.reply(recommendation);
+        console.log(`[BOT] Replied with event recommendation`);
+      } catch (err) {
+        console.error('[BOT] Failed to reply:', err.message);
+        // Fallback static reply
+        await msg.reply(
+          `🎉 *The Best Parties*\n\nCheck out our events ➡️ ${TBP_URL}/events`
+        ).catch(() => {});
+      }
+    }
+    return; // don't process other group messages
+  }
+
+  // In DMs: always respond with event info
+  console.log(`[BOT] DM from ${msg.from}: ${msg.body.slice(0, 50)}...`);
+  try {
+    const recommendation = await getRecommendation(msg.body);
+    await msg.reply(recommendation);
+  } catch (err) {
+    console.error('[BOT] DM reply failed:', err.message);
+    await msg.reply(
+      `🎉 *The Best Parties*\n\nCheck out our events ➡️ ${TBP_URL}/events`
+    ).catch(() => {});
+  }
+});
+
 console.log('Initializing WhatsApp client...');
-client.initialize().catch(err => {
-  console.error('Failed to initialize WhatsApp client:', err.message);
-  clientStatus = 'error';
-});
+client.initialize().catch(err => { console.error('Init failed:', err.message); clientStatus = 'error'; });
 
-// --- Routes ---
+// ─── API Routes ──────────────────────────────────────────────────────────
 
-// Health check (no auth)
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', whatsapp: clientStatus });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', whatsapp: clientStatus }));
 
-// GET /api/whatsapp/status
 app.get('/api/whatsapp/status', (req, res) => {
-  res.json({
-    status: clientStatus,
-    ready: clientReady,
-    hasQr: !!currentQr,
-  });
+  res.json({ status: clientStatus, ready: clientReady, hasQr: !!currentQr });
 });
 
-// GET /api/whatsapp/qr
 app.get('/api/whatsapp/qr', async (req, res) => {
-  if (clientReady) {
-    return res.json({ qr: null, message: 'Already connected' });
-  }
-  if (!currentQr) {
-    return res.json({ qr: null, message: 'No QR code available yet, client is ' + clientStatus });
-  }
+  if (clientReady) return res.json({ qr: null, message: 'Already connected' });
+  if (!currentQr) return res.json({ qr: null, message: 'No QR yet, status: ' + clientStatus });
   try {
     const qrDataUrl = await qrcode.toDataURL(currentQr);
-    res.json({ qr: qrDataUrl });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to generate QR code image' });
-  }
+    res.json({ qr: qrDataUrl, qrDataUrl }); // both keys for compat
+  } catch { res.status(500).json({ error: 'QR generation failed' }); }
 });
 
-// GET /api/whatsapp/groups
 app.get('/api/whatsapp/groups', async (req, res) => {
-  if (!clientReady) {
-    return res.status(503).json({ error: 'WhatsApp not connected', groups: [] });
-  }
+  if (!clientReady) return res.status(503).json({ error: 'Not connected', groups: [] });
   try {
     const chats = await client.getChats();
-    const groups = chats
-      .filter(chat => chat.isGroup)
-      .map(chat => ({
-        id: chat.id._serialized,
-        name: chat.name,
-        participantCount: chat.participants ? chat.participants.length : undefined,
-      }));
+    const groups = chats.filter(c => c.isGroup).map(c => ({
+      id: c.id._serialized, name: c.name,
+      participantCount: c.participants ? c.participants.length : undefined,
+    }));
     res.json({ groups });
-  } catch (err) {
-    console.error('Error fetching groups:', err.message);
-    res.status(500).json({ error: 'Failed to fetch groups', groups: [] });
-  }
+  } catch (err) { res.status(500).json({ error: err.message, groups: [] }); }
 });
 
-// POST /api/whatsapp/broadcast
+// Manual broadcast (from UI)
 app.post('/api/whatsapp/broadcast', async (req, res) => {
-  if (!clientReady) {
-    return res.status(503).json({ error: 'WhatsApp not connected' });
-  }
+  if (!clientReady) return res.status(503).json({ error: 'Not connected' });
 
-  const { groupIds, message } = req.body;
+  const chatIds = req.body.chatIds || req.body.groupIds;
+  const { message } = req.body;
 
-  if (!groupIds || !Array.isArray(groupIds) || groupIds.length === 0) {
-    return res.status(400).json({ error: 'groupIds must be a non-empty array' });
-  }
-  if (!message || typeof message !== 'string' || message.trim().length === 0) {
-    return res.status(400).json({ error: 'message must be a non-empty string' });
-  }
+  if (!chatIds || !Array.isArray(chatIds) || chatIds.length === 0)
+    return res.status(400).json({ error: 'chatIds/groupIds required' });
+  if (!message || typeof message !== 'string')
+    return res.status(400).json({ error: 'message required' });
+  if (chatIds.length > 50)
+    return res.status(400).json({ error: 'Max 50 per broadcast' });
 
-  const results = [];
-  for (const groupId of groupIds) {
+  let sent = 0, failed = 0;
+  for (const id of chatIds) {
     try {
-      await client.sendMessage(groupId, message);
-      results.push({ groupId, success: true });
+      await client.sendMessage(id, message);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500)); // rate limit
     } catch (err) {
-      console.error(`Failed to send to ${groupId}:`, err.message);
-      results.push({ groupId, success: false, error: err.message });
+      failed++;
+      console.error(`Broadcast fail ${id}:`, err.message);
     }
   }
-
-  const successCount = results.filter(r => r.success).length;
-  res.json({
-    sent: successCount,
-    failed: results.length - successCount,
-    total: results.length,
-    results,
-  });
+  res.json({ sent, failed, total: chatIds.length });
 });
 
-// --- Start Server ---
+// Auto-broadcast events (fetches from Kartis, sends to groups)
+app.post('/api/whatsapp/broadcast-events', async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: 'Not connected' });
+
+  const chatIds = req.body.chatIds || req.body.groupIds;
+  const maxEvents = req.body.maxEvents || 5;
+
+  if (!chatIds || !Array.isArray(chatIds) || chatIds.length === 0)
+    return res.status(400).json({ error: 'chatIds/groupIds required' });
+
+  try {
+    const message = await formatEventsForBroadcast(maxEvents);
+    let sent = 0, failed = 0;
+    for (const id of chatIds) {
+      try {
+        await client.sendMessage(id, message);
+        sent++;
+        await new Promise(r => setTimeout(r, 1500));
+      } catch { failed++; }
+    }
+    res.json({ sent, failed, total: chatIds.length, message });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Start ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`WhatsApp Broadcast server listening on 0.0.0.0:${PORT}`);
+  console.log(`WhatsApp Standalone server on 0.0.0.0:${PORT}`);
+  console.log(`Events API: ${KARTIS_EVENTS_URL}`);
+  console.log(`TBP URL: ${TBP_URL}`);
 });
