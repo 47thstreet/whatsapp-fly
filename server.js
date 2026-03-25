@@ -4,6 +4,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const leads = require('./leads');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -49,6 +50,9 @@ const AUTO_RULES_FILE = path.join(DATA_DIR, 'auto-rules.json');
 const CONTACTS_FILE = path.join(DATA_DIR, 'contacts.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const GROUP_STATS_FILE = path.join(DATA_DIR, 'group-stats.json');
+const CRM_FILE = path.join(DATA_DIR, 'crm.json');
+const BLOCKLIST_FILE = path.join(DATA_DIR, 'blocklist.json');
+const LISTS_FILE = path.join(DATA_DIR, 'lists.json');
 
 // ─── Cooldown System ─────────────────────────────────────────────────────
 const groupCooldowns = new Map(); // groupId -> timestamp
@@ -119,7 +123,318 @@ function addToFeed(entry) {
   if (scannerFeed.length > MAX_FEED) scannerFeed.length = MAX_FEED;
 }
 
-// ─── Contact Capture ─────────────────────────────────────────────────────
+// ─── CRM In-Memory Store ────────────────────────────────────────────────
+const crmContacts = new Map(); // phone -> contact object
+let crmDirty = false;
+
+function loadCRM() {
+  const data = loadJSON(CRM_FILE, []);
+  crmContacts.clear();
+  for (const c of data) {
+    crmContacts.set(c.id, c);
+  }
+  console.log(`CRM loaded: ${crmContacts.size} contacts`);
+}
+
+function saveCRM() {
+  if (!crmDirty) return;
+  const arr = Array.from(crmContacts.values());
+  saveJSON(CRM_FILE, arr);
+  crmDirty = false;
+}
+
+// Flush CRM to disk every 30 seconds
+setInterval(saveCRM, 30000);
+
+function getBlocklist() {
+  return loadJSON(BLOCKLIST_FILE, []);
+}
+
+function isBlocked(phone) {
+  const bl = getBlocklist();
+  return bl.some(b => b.phone === phone);
+}
+
+function phoneFromJid(jid) {
+  // "972501234567@c.us" -> "972501234567"
+  return jid.split('@')[0];
+}
+
+function formatPhone(id) {
+  // Ensure phone starts with +
+  const num = id.replace(/[^0-9]/g, '');
+  return '+' + num;
+}
+
+function calculateScore(contact) {
+  let score = contact.score || 0;
+  // Apply decay: -5 per week of inactivity
+  if (contact.profile && contact.profile.lastActive) {
+    const lastActive = new Date(contact.profile.lastActive).getTime();
+    const weeksSinceActive = Math.floor((Date.now() - lastActive) / (7 * 24 * 60 * 60 * 1000));
+    if (weeksSinceActive > 0) {
+      score = Math.max(0, score - (weeksSinceActive * 5));
+    }
+  }
+  return Math.min(100, Math.max(0, score));
+}
+
+function statusFromScore(score) {
+  if (score <= 20) return 'cold';
+  if (score <= 40) return 'new';
+  if (score <= 60) return 'warm';
+  if (score <= 80) return 'hot';
+  return 'vip';
+}
+
+function getCrmContact(phoneId) {
+  const contact = crmContacts.get(phoneId);
+  if (!contact) return null;
+  // Recalculate score with decay
+  contact.score = calculateScore(contact);
+  contact.status = contact.blocked ? 'blocked' : statusFromScore(contact.score);
+  return contact;
+}
+
+function upsertCrmContact(phoneId, updates) {
+  const now = new Date().toISOString();
+  let contact = crmContacts.get(phoneId);
+  if (!contact) {
+    contact = {
+      id: phoneId,
+      phone: formatPhone(phoneId),
+      name: null,
+      pushName: null,
+      profilePic: null,
+      source: { type: 'unknown', firstSeen: now },
+      tags: [],
+      lists: ['all-contacts'],
+      profile: {
+        language: null,
+        interests: [],
+        lastActive: now,
+        messageCount: 0,
+        firstMessage: null,
+        lastMessage: null,
+        triggeredKeywords: [],
+        dmSent: false,
+        dmSentAt: null,
+        responded: false,
+        respondedAt: null,
+        eventsClicked: 0,
+        ticketsPurchased: 0,
+      },
+      score: 0,
+      status: 'new',
+      blocked: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+    crmContacts.set(phoneId, contact);
+  }
+  // Apply updates
+  if (updates.name) contact.name = updates.name;
+  if (updates.pushName) contact.pushName = updates.pushName;
+  if (updates.source && !contact.source.groupId) contact.source = updates.source;
+  if (updates.tags) {
+    for (const tag of updates.tags) {
+      if (!contact.tags.includes(tag)) contact.tags.push(tag);
+    }
+  }
+  if (updates.lists) {
+    for (const list of updates.lists) {
+      if (!contact.lists.includes(list)) contact.lists.push(list);
+    }
+  }
+  if (updates.profile) {
+    Object.assign(contact.profile, updates.profile);
+  }
+  if (updates.score !== undefined) {
+    contact.score = Math.min(100, Math.max(0, updates.score));
+  }
+  contact.updatedAt = now;
+  contact.score = calculateScore(contact);
+  contact.status = contact.blocked ? 'blocked' : statusFromScore(contact.score);
+  crmDirty = true;
+  return contact;
+}
+
+// ─── CRM Settings Helpers ───────────────────────────────────────────────
+
+function getCrmSettings() {
+  const settings = loadJSON(SETTINGS_FILE, {});
+  return {
+    autoDmEnabled: settings.autoDmEnabled || false,
+    autoDmTemplate: settings.autoDmTemplate || "Hey {name}! 🎉 Saw you're looking for events. Here's what's coming up:\n\n{events}\n\n— The Best Parties",
+    autoDmCooldownHours: settings.autoDmCooldownHours || 24,
+    scrapeIntervalHours: settings.scrapeIntervalHours || 6,
+  };
+}
+
+function canSendAutoDm(contact) {
+  const settings = getCrmSettings();
+  if (!settings.autoDmEnabled) return false;
+  if (contact.blocked) return false;
+  if (contact.profile.dmSent && contact.profile.dmSentAt) {
+    const cooldownMs = settings.autoDmCooldownHours * 60 * 60 * 1000;
+    if (Date.now() - new Date(contact.profile.dmSentAt).getTime() < cooldownMs) return false;
+  }
+  return true;
+}
+
+// ─── Group Scraper ──────────────────────────────────────────────────────
+
+async function scrapeGroupParticipants(client, chat) {
+  const results = { scraped: 0, new: 0, updated: 0 };
+  try {
+    const groupId = chat.id._serialized;
+    const groupName = chat.name || groupId;
+    const listSlug = groupName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    // Ensure list exists for this group
+    const lists = loadJSON(LISTS_FILE, []);
+    if (!lists.find(l => l.id === listSlug)) {
+      lists.push({ id: listSlug, name: groupName, description: `Auto-created from group: ${groupName}`, createdAt: new Date().toISOString() });
+      saveJSON(LISTS_FILE, lists);
+    }
+
+    // Get participants - chat.participants is populated for groups
+    const participants = chat.participants || [];
+    for (const p of participants) {
+      const phoneId = p.id._serialized ? phoneFromJid(p.id._serialized) : phoneFromJid(p.id.user || p.id._serialized);
+      if (!phoneId || phoneId.length < 5) continue;
+      if (isBlocked(formatPhone(phoneId))) continue;
+
+      results.scraped++;
+      const existing = crmContacts.has(phoneId);
+
+      upsertCrmContact(phoneId, {
+        source: {
+          type: 'group_scrape',
+          groupId,
+          groupName,
+          firstSeen: new Date().toISOString(),
+        },
+        tags: [listSlug],
+        lists: ['all-contacts', listSlug],
+        profile: { lastActive: new Date().toISOString() },
+      });
+
+      if (existing) results.updated++;
+      else results.new++;
+    }
+  } catch (err) {
+    console.error(`Scrape error for group ${chat.name}:`, err.message);
+  }
+  return results;
+}
+
+async function scrapeAllGroups() {
+  console.log('CRM: Starting group scrape across all accounts...');
+  const totals = { scraped: 0, new: 0, updated: 0 };
+
+  for (const [accountId, acc] of accounts) {
+    if (!acc.ready) continue;
+    try {
+      const chats = await acc.client.getChats();
+      const groups = chats.filter(c => c.isGroup);
+      console.log(`[${accountId}] Scraping ${groups.length} groups...`);
+
+      for (const group of groups) {
+        const result = await scrapeGroupParticipants(acc.client, group);
+        totals.scraped += result.scraped;
+        totals.new += result.new;
+        totals.updated += result.updated;
+      }
+    } catch (err) {
+      console.error(`[${accountId}] Scrape failed:`, err.message);
+    }
+  }
+
+  saveCRM(); // Force flush after scrape
+  console.log(`CRM: Scrape complete — scraped: ${totals.scraped}, new: ${totals.new}, updated: ${totals.updated}`);
+  return totals;
+}
+
+// Schedule periodic scraping
+let scrapeInterval = null;
+function startScrapeSchedule() {
+  const hours = getCrmSettings().scrapeIntervalHours;
+  if (scrapeInterval) clearInterval(scrapeInterval);
+  scrapeInterval = setInterval(() => scrapeAllGroups(), hours * 60 * 60 * 1000);
+  console.log(`CRM: Scrape scheduled every ${hours} hours`);
+}
+
+// ─── Contact Profiling ──────────────────────────────────────────────────
+
+const INTEREST_KEYWORDS = {
+  parties: ['party', 'parties', 'מסיבה', 'מסיבות'],
+  tickets: ['ticket', 'tickets', 'כרטיס', 'כרטיסים', 'טיקט'],
+  tables: ['table', 'tables', 'שולחן', 'שולחנות'],
+  vip: ['vip', 'אוויאיפי'],
+  bottles: ['bottle', 'bottles', 'בקבוק', 'בקבוקים'],
+  nightlife: ['club', 'nightlife', 'מועדון'],
+};
+
+function detectLanguage(text) {
+  return /[\u0590-\u05FF]/.test(text) ? 'he' : 'en';
+}
+
+function extractInterests(text) {
+  const lower = text.toLowerCase();
+  const found = [];
+  for (const [interest, keywords] of Object.entries(INTEREST_KEYWORDS)) {
+    if (keywords.some(kw => lower.includes(kw))) found.push(interest);
+  }
+  return found;
+}
+
+function profileContactFromMessage(phoneId, message, pushName) {
+  const contact = getCrmContact(phoneId) || upsertCrmContact(phoneId, {});
+  const lang = detectLanguage(message);
+  const interests = extractInterests(message);
+  const lower = message.toLowerCase();
+
+  let scoreBoost = 0;
+  const newKeywords = [];
+
+  // Check for keyword triggers
+  for (const kw of PARTY_KEYWORDS) {
+    if (lower.includes(kw.toLowerCase()) && !contact.profile.triggeredKeywords.includes(kw)) {
+      newKeywords.push(kw);
+      scoreBoost += contact.profile.triggeredKeywords.length === 0 ? 10 : 5;
+    }
+  }
+
+  // Ticket/price interest
+  if (/ticket|price|כרטיס|מחיר|כמה עולה|how much/.test(lower)) scoreBoost += 15;
+  // Table/VIP interest
+  if (/table|vip|שולחן/.test(lower)) scoreBoost += 30;
+
+  const updates = {
+    pushName: pushName || contact.pushName,
+    profile: {
+      language: lang,
+      lastActive: new Date().toISOString(),
+      messageCount: (contact.profile.messageCount || 0) + 1,
+      lastMessage: message.slice(0, 500),
+      triggeredKeywords: [...contact.profile.triggeredKeywords, ...newKeywords],
+    },
+    score: (contact.score || 0) + scoreBoost,
+  };
+
+  if (!contact.profile.firstMessage) {
+    updates.profile.firstMessage = message.slice(0, 500);
+  }
+
+  if (interests.length > 0) {
+    updates.profile.interests = [...new Set([...(contact.profile.interests || []), ...interests])];
+  }
+
+  return upsertCrmContact(phoneId, updates);
+}
+
+// ─── Contact Capture (legacy, still used for DMs) ───────────────────────
 function autoTagContact(message) {
   const lower = message.toLowerCase();
   if (/ticket|כרטיס|טיקט/.test(lower)) return 'tickets';
@@ -514,10 +829,54 @@ function setupClientEvents(accountId, client) {
       const intentMatch = isPartyIntent(msg.body);
       const isPartyQuery = keywordMatch || intentMatch;
 
+      // Lead detection — runs on every group message
+      const groupId = chat.id._serialized;
+      const senderName = msg.author || msg.from;
+      const lead = leads.detectLead(msg.body, senderName, msg.from, chat.name, groupId);
+      if (lead.isLead) {
+        leads.storeLead({ ...lead, groupId, groupName: chat.name, senderId: msg.from, senderName, account: accountId });
+      }
+
       if (isPartyQuery) {
-        const groupId = chat.id._serialized;
-        const senderName = msg.author || msg.from;
         console.log(`[${accountId}] Party ${intentMatch ? 'intent' : 'keyword'} in group "${chat.name}" from ${senderName}`);
+
+        // CRM: Profile contact from group message
+        const senderJid = msg.author || msg.from;
+        const senderPhone = phoneFromJid(senderJid);
+        if (senderPhone && !isBlocked(formatPhone(senderPhone))) {
+          const contact = await msg.getContact().catch(() => null);
+          const pushName = contact ? (contact.pushname || contact.name || null) : null;
+          const groupSlug = (chat.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+          profileContactFromMessage(senderPhone, msg.body, pushName);
+          upsertCrmContact(senderPhone, {
+            source: { type: 'group_scrape', groupId, groupName: chat.name, firstSeen: new Date().toISOString() },
+            tags: [groupSlug],
+            lists: ['all-contacts', groupSlug],
+          });
+
+          // Auto-DM if enabled and cooldown passed for this contact
+          const crmContact = getCrmContact(senderPhone);
+          if (crmContact && canSendAutoDm(crmContact)) {
+            try {
+              const settings = getCrmSettings();
+              const recommendation = await getRecommendation(msg.body);
+              const dmMessage = settings.autoDmTemplate
+                .replace('{name}', pushName || 'there')
+                .replace('{events}', recommendation);
+              const dmChat = await acc.client.getChatById(senderJid).catch(() => null);
+              if (dmChat) {
+                await dmChat.sendMessage(dmMessage);
+                upsertCrmContact(senderPhone, {
+                  profile: { dmSent: true, dmSentAt: new Date().toISOString() },
+                });
+                console.log(`[${accountId}] Auto-DM sent to ${senderPhone}`);
+              }
+            } catch (dmErr) {
+              console.error(`[${accountId}] Auto-DM failed for ${senderPhone}:`, dmErr.message);
+            }
+          }
+        }
 
         // Track stats
         updateGroupStats(groupId, chat.name, 'query');
@@ -565,12 +924,26 @@ function setupClientEvents(accountId, client) {
       return;
     }
 
-    // In DMs: capture contact + always respond with event info
+    // In DMs: capture contact + CRM profiling + always respond with event info
     console.log(`[${accountId}] DM from ${msg.from}: ${msg.body.slice(0, 50)}...`);
     try {
       const contact = await msg.getContact().catch(() => null);
       const contactName = contact ? (contact.pushname || contact.name || null) : null;
       captureContact(msg.from, contactName, msg.body);
+
+      // CRM: Profile DM contact and mark as responded if they were DM'd before
+      const dmPhone = phoneFromJid(msg.from);
+      if (dmPhone && !isBlocked(formatPhone(dmPhone))) {
+        profileContactFromMessage(dmPhone, msg.body, contactName);
+        const crmContact = getCrmContact(dmPhone);
+        if (crmContact && crmContact.profile.dmSent && !crmContact.profile.responded) {
+          upsertCrmContact(dmPhone, {
+            profile: { responded: true, respondedAt: new Date().toISOString() },
+            score: (crmContact.score || 0) + 20,
+          });
+          console.log(`[${accountId}] CRM: DM response from ${dmPhone}, +20 score`);
+        }
+      }
     } catch (e) {
       console.error(`[${accountId}] Contact capture failed:`, e.message);
     }
@@ -1130,26 +1503,35 @@ app.delete('/api/whatsapp/contacts/:id', (req, res) => {
   res.json({ ok: true, deleted: req.params.id });
 });
 
-// ─── Settings Endpoints (Quiet Hours, Cooldown) ─────────────────────────
+// ─── Settings Endpoints (Quiet Hours, Cooldown, CRM) ────────────────────
 
 app.get('/api/whatsapp/settings', (req, res) => {
   const settings = loadJSON(SETTINGS_FILE, {});
   const { start, end } = getQuietHours();
+  const crmSettings = getCrmSettings();
   res.json({
     quietStart: start,
     quietEnd: end,
     cooldownMinutes: getCooldownMinutes(),
     isQuietNow: isQuietHours(),
+    ...crmSettings,
     ...settings,
   });
 });
 
 app.put('/api/whatsapp/settings', (req, res) => {
   const settings = loadJSON(SETTINGS_FILE, {});
-  const { quietStart, quietEnd, cooldownMinutes } = req.body;
+  const { quietStart, quietEnd, cooldownMinutes, autoDmEnabled, autoDmTemplate, autoDmCooldownHours, scrapeIntervalHours } = req.body;
   if (quietStart !== undefined) settings.quietStart = quietStart;
   if (quietEnd !== undefined) settings.quietEnd = quietEnd;
   if (cooldownMinutes !== undefined) settings.cooldownMinutes = Number(cooldownMinutes);
+  if (autoDmEnabled !== undefined) settings.autoDmEnabled = Boolean(autoDmEnabled);
+  if (autoDmTemplate !== undefined) settings.autoDmTemplate = String(autoDmTemplate);
+  if (autoDmCooldownHours !== undefined) settings.autoDmCooldownHours = Number(autoDmCooldownHours);
+  if (scrapeIntervalHours !== undefined) {
+    settings.scrapeIntervalHours = Number(scrapeIntervalHours);
+    startScrapeSchedule(); // Restart schedule with new interval
+  }
   saveJSON(SETTINGS_FILE, settings);
   res.json({ ok: true, settings });
 });
@@ -1183,11 +1565,83 @@ app.get('/api/whatsapp/scanner/stats', (req, res) => {
   res.json({ totalQueriesToday: totalQueries, totalResponsesToday: totalResponses, activeGroupsToday: activeGroups });
 });
 
+// ─── Leads Monitor Endpoints ─────────────────────────────────────────────
+
+app.get('/api/whatsapp/leads', (req, res) => {
+  const filters = {
+    status: req.query.status,
+    group: req.query.group,
+    account: req.query.account,
+    minConfidence: req.query.minConfidence,
+    category: req.query.category,
+    language: req.query.language,
+    limit: req.query.limit,
+    offset: req.query.offset,
+  };
+  res.json(leads.getLeads(filters));
+});
+
+app.get('/api/whatsapp/leads/stats', (req, res) => {
+  res.json(leads.getLeadStats());
+});
+
+app.get('/api/whatsapp/leads/export', (req, res) => {
+  const csv = leads.exportLeadsCsv({
+    status: req.query.status,
+    group: req.query.group,
+    account: req.query.account,
+  });
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename=leads.csv');
+  res.send(csv);
+});
+
+app.put('/api/whatsapp/leads/:id', (req, res) => {
+  const { status, note } = req.body;
+  if (!status) return res.status(400).json({ error: 'status required' });
+  try {
+    const lead = leads.updateLeadStatus(req.params.id, status, note);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    res.json({ ok: true, lead });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get('/api/whatsapp/keywords', (req, res) => {
+  res.json(leads.getCustomKeywords());
+});
+
+app.post('/api/whatsapp/keywords', (req, res) => {
+  const { keywords, category } = req.body;
+  if (!keywords || !Array.isArray(keywords) || !category) {
+    return res.status(400).json({ error: 'keywords[] and category required' });
+  }
+  try {
+    const updated = leads.setCustomKeywords({ keywords, category });
+    res.json({ ok: true, custom: updated });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete('/api/whatsapp/keywords/:keyword', (req, res) => {
+  const keyword = decodeURIComponent(req.params.keyword);
+  const removed = leads.removeCustomKeyword(keyword);
+  if (!removed) return res.status(404).json({ error: 'Keyword not found in custom keywords' });
+  res.json({ ok: true, deleted: keyword });
+});
+
 // ─── Start ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`WhatsApp Multi-Account server on 0.0.0.0:${PORT}`);
   console.log(`Events API: ${KARTIS_EVENTS_URL}`);
   console.log(`TBP URL: ${TBP_URL}`);
+  leads.initLeads(DATA_DIR);
+  loadCRM();
   loadAndInitAccounts();
+  startScrapeSchedule();
+  // Initial scrape 60s after startup (give clients time to connect)
+  setTimeout(() => scrapeAllGroups(), 60000);
 });
