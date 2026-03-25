@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: whatsapp-broadcast-tbp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: ohio
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+      - key: JWT_SECRET
+        generateValue: true
+    disk:
+      name: whatsapp-data
+      mountPath: /data
+      sizeGB: 1

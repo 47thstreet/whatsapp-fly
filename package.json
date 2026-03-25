@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-broadcast-tbp",
+  "version": "1.0.0",
+  "description": "WhatsApp Web backend for broadcast messaging",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.26.0"
+  }
+}
